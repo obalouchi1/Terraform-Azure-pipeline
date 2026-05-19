@@ -1,0 +1,192 @@
+# ============================================================
+# Terraform CI/CD Pipeline — Azure DevOps
+# ============================================================
+# Prerequisites:
+#   1. Azure DevOps Variable Group named "terraform-secrets" with:
+#        - ARM_CLIENT_ID
+#        - ARM_CLIENT_SECRET
+#        - ARM_SUBSCRIPTION_ID
+#        - ARM_TENANT_ID
+#   2. Azure Storage Account for remote state (backend)
+#   3. tfenv OR use the TerraformInstaller task (used below)
+# ============================================================
+
+trigger:
+  branches:
+    include:
+      - main
+  paths:
+    include:
+      - '**/*.tf'
+      - '**/*.tfvars'
+
+pr:
+  branches:
+    include:
+      - main
+  paths:
+    include:
+      - '**/*.tf'
+      - '**/*.tfvars'
+
+variables:
+  - group: terraform-secrets          # ARM_CLIENT_ID, ARM_CLIENT_SECRET, etc.
+  - name: TF_VERSION
+    value: '1.7.5'                    # Pin Terraform version — matches .terraform-version
+  - name: TF_WORKING_DIR
+    value: '$(System.DefaultWorkingDirectory)'
+  - name: BACKEND_RESOURCE_GROUP
+    value: 'tfstate-rg'
+  - name: BACKEND_STORAGE_ACCOUNT
+    value: 'tfstate12345'             # Your storage account name
+  - name: BACKEND_CONTAINER
+    value: 'tfstate'
+  - name: BACKEND_KEY
+    value: 'prod.terraform.tfstate'
+
+# ============================================================
+# STAGE 1 — Validate & Plan (runs on every PR and push)
+# ============================================================
+stages:
+  - stage: validate_and_plan
+    displayName: 'Validate & Plan'
+    jobs:
+      - job: terraform_plan
+        displayName: 'Terraform Init, Validate & Plan'
+        pool:
+          vmImage: 'ubuntu-latest'
+
+        steps:
+          # Install pinned Terraform version
+          - task: TerraformInstaller@1
+            displayName: 'Install Terraform $(TF_VERSION)'
+            inputs:
+              terraformVersion: $(TF_VERSION)
+
+          # terraform init — connects to Azure Storage backend
+          - task: TerraformTaskV4@4
+            displayName: 'terraform init'
+            inputs:
+              provider: 'azurerm'
+              command: 'init'
+              workingDirectory: $(TF_WORKING_DIR)
+              backendServiceArm: 'AzureServiceConnection'   # Your Azure DevOps service connection name
+              backendAzureRmResourceGroupName: $(BACKEND_RESOURCE_GROUP)
+              backendAzureRmStorageAccountName: $(BACKEND_STORAGE_ACCOUNT)
+              backendAzureRmContainerName: $(BACKEND_CONTAINER)
+              backendAzureRmKey: $(BACKEND_KEY)
+            env:
+              ARM_CLIENT_ID: $(ARM_CLIENT_ID)
+              ARM_CLIENT_SECRET: $(ARM_CLIENT_SECRET)
+              ARM_SUBSCRIPTION_ID: $(ARM_SUBSCRIPTION_ID)
+              ARM_TENANT_ID: $(ARM_TENANT_ID)
+
+          # terraform validate — catches syntax and config errors
+          - task: TerraformTaskV4@4
+            displayName: 'terraform validate'
+            inputs:
+              provider: 'azurerm'
+              command: 'validate'
+              workingDirectory: $(TF_WORKING_DIR)
+
+          # terraform fmt check — fails if code isn't formatted
+          - script: |
+              terraform fmt -check -recursive
+              if [ $? -ne 0 ]; then
+                echo "##vso[task.logissue type=error]Run 'terraform fmt -recursive' locally and commit the changes."
+                exit 1
+              fi
+            displayName: 'terraform fmt check'
+            workingDirectory: $(TF_WORKING_DIR)
+
+          # terraform plan — saves plan to file for apply stage
+          - task: TerraformTaskV4@4
+            displayName: 'terraform plan'
+            inputs:
+              provider: 'azurerm'
+              command: 'plan'
+              workingDirectory: $(TF_WORKING_DIR)
+              commandOptions: '-out=$(Build.ArtifactStagingDirectory)/tfplan -input=false'
+              environmentServiceNameAzureRM: 'AzureServiceConnection'
+            env:
+              ARM_CLIENT_ID: $(ARM_CLIENT_ID)
+              ARM_CLIENT_SECRET: $(ARM_CLIENT_SECRET)
+              ARM_SUBSCRIPTION_ID: $(ARM_SUBSCRIPTION_ID)
+              ARM_TENANT_ID: $(ARM_TENANT_ID)
+
+          # Publish plan artifact so apply stage can consume it
+          - task: PublishBuildArtifacts@1
+            displayName: 'Publish tfplan artifact'
+            inputs:
+              PathtoPublish: '$(Build.ArtifactStagingDirectory)/tfplan'
+              ArtifactName: 'tfplan'
+              publishLocation: 'Container'
+
+# ============================================================
+# STAGE 2 — Apply (runs only on merge to main)
+# ============================================================
+  - stage: apply
+    displayName: 'Apply'
+    dependsOn: validate_and_plan
+    condition: |
+      and(
+        succeeded('validate_and_plan'),
+        eq(variables['Build.SourceBranch'], 'refs/heads/main')
+      )
+    jobs:
+      - deployment: terraform_apply
+        displayName: 'Terraform Apply'
+        pool:
+          vmImage: 'ubuntu-latest'
+        environment: 'production'     # Requires manual approval gate in Azure DevOps Environments
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                # Install same pinned Terraform version
+                - task: TerraformInstaller@1
+                  displayName: 'Install Terraform $(TF_VERSION)'
+                  inputs:
+                    terraformVersion: $(TF_VERSION)
+
+                # Download the plan artifact from the previous stage
+                - task: DownloadBuildArtifacts@1
+                  displayName: 'Download tfplan artifact'
+                  inputs:
+                    buildType: 'current'
+                    downloadType: 'single'
+                    artifactName: 'tfplan'
+                    downloadPath: '$(System.ArtifactsDirectory)'
+
+                # terraform init again (required in new agent)
+                - task: TerraformTaskV4@4
+                  displayName: 'terraform init'
+                  inputs:
+                    provider: 'azurerm'
+                    command: 'init'
+                    workingDirectory: $(TF_WORKING_DIR)
+                    backendServiceArm: 'AzureServiceConnection'
+                    backendAzureRmResourceGroupName: $(BACKEND_RESOURCE_GROUP)
+                    backendAzureRmStorageAccountName: $(BACKEND_STORAGE_ACCOUNT)
+                    backendAzureRmContainerName: $(BACKEND_CONTAINER)
+                    backendAzureRmKey: $(BACKEND_KEY)
+                  env:
+                    ARM_CLIENT_ID: $(ARM_CLIENT_ID)
+                    ARM_CLIENT_SECRET: $(ARM_CLIENT_SECRET)
+                    ARM_SUBSCRIPTION_ID: $(ARM_SUBSCRIPTION_ID)
+                    ARM_TENANT_ID: $(ARM_TENANT_ID)
+
+                # terraform apply — uses the saved plan, no surprises
+                - task: TerraformTaskV4@4
+                  displayName: 'terraform apply'
+                  inputs:
+                    provider: 'azurerm'
+                    command: 'apply'
+                    workingDirectory: $(TF_WORKING_DIR)
+                    commandOptions: '-input=false $(System.ArtifactsDirectory)/tfplan'
+                    environmentServiceNameAzureRM: 'AzureServiceConnection'
+                  env:
+                    ARM_CLIENT_ID: $(ARM_CLIENT_ID)
+                    ARM_CLIENT_SECRET: $(ARM_CLIENT_SECRET)
+                    ARM_SUBSCRIPTION_ID: $(ARM_SUBSCRIPTION_ID)
+                    ARM_TENANT_ID: $(ARM_TENANT_ID)
