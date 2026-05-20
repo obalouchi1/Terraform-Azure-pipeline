@@ -1,0 +1,18 @@
+# Local Terraform state — never commit
+*.tfstate
+*.tfstate.backup
+.terraform/
+*.tfplan
+
+# Credentials — never commit
+*.tfvars.json
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
+# Crash logs
+crash.log
+crash.*.log
+
+# NOTE: .terraform.lock.hcl SHOULD be committed — do not add it here
